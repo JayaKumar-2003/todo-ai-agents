@@ -1,12 +1,84 @@
 import uuid
 import json
+from typing import Tuple
 from sqlalchemy.orm import Session
 from models.session import SessionTable
 from models.chat_history import ChatHistory
 from models.agent_interaction import AgentInteraction
 from services.llm import LLMService
-from typing import Tuple
 from services.todo_docx import add_todo_to_docx, read_todos_from_docx
+
+# pyrefly: ignore [missing-import]
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+
+class SQLAlchemyChatMessageHistory(BaseChatMessageHistory):
+    """
+    Custom LangChain chat message history adapter that integrates directly 
+    with the SQLAlchemy ChatHistory model.
+    """
+    def __init__(self, session_id: str, chat_id: str, db: Session):
+        self.session_id = session_id
+        self.chat_id = chat_id
+        self.db = db
+        
+        # Load or create the chat history record in the database
+        self.chat_history_record = self.db.query(ChatHistory).filter(ChatHistory.chat_id == self.chat_id).first()
+        if not self.chat_history_record:
+            self.chat_history_record = ChatHistory(
+                chat_id=self.chat_id,
+                session_id=self.session_id,
+                chat_messages=json.dumps([])
+            )
+            self.db.add(self.chat_history_record)
+            self.db.commit()
+            self.db.refresh(self.chat_history_record)
+
+    @property
+    def messages(self) -> list[BaseMessage]:
+        try:
+            stored_msgs = json.loads(self.chat_history_record.chat_messages)
+        except Exception:
+            stored_msgs = []
+            
+        lg_messages = []
+        for msg in stored_msgs:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "user":
+                lg_messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                lg_messages.append(AIMessage(content=content))
+            elif role == "system":
+                lg_messages.append(SystemMessage(content=content))
+        return lg_messages
+
+    def add_messages(self, messages: list[BaseMessage]) -> None:
+        try:
+            stored_msgs = json.loads(self.chat_history_record.chat_messages)
+        except Exception:
+            stored_msgs = []
+            
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                role = "user"
+            elif isinstance(msg, AIMessage):
+                role = "assistant"
+            elif isinstance(msg, SystemMessage):
+                role = "system"
+            else:
+                role = msg.type
+            stored_msgs.append({"role": role, "content": msg.content})
+            
+        self.chat_history_record.chat_messages = json.dumps(stored_msgs)
+        self.db.commit()
+
+    def clear(self) -> None:
+        self.chat_history_record.chat_messages = json.dumps([])
+        self.db.commit()
 
 class ChatService:
     """
@@ -93,7 +165,7 @@ class ChatService:
         Takes the last 10 messages from a conversation list and formats them into a prompt context.
         
         Args:
-            messages: A list of dict messages.
+            messages: A list of LangChain BaseMessage objects.
             
         Returns:
             A formatted history string.
@@ -101,8 +173,8 @@ class ChatService:
         last_10 = messages[-10:]
         formatted_history = ""
         for msg in last_10:
-            role_label = "User" if msg["role"] == "user" else "Assistant"
-            formatted_history += f"{role_label}: {msg['content']}\n"
+            role_label = "User" if msg.type == "human" else "Assistant"
+            formatted_history += f"{role_label}: {msg.content}\n"
         return formatted_history
 
     @classmethod
@@ -117,42 +189,29 @@ class ChatService:
         """
         Processes a new user message:
         - Retrieves/creates a session and its chat history, supporting multiple chat contexts.
-        - Extracts and formats the last 10 messages from history.
-        - Constructs a prompt differentiating between conversation history and the current message.
-        - Invokes the LLM with this prompt context.
-        - Appends both user message and assistant reply to the database history.
-        - Logs the interaction in the AgentInteraction table.
-        
-        Args:
-            db: The SQLAlchemy Session.
-            user_input: The user's prompt text.
-            session_id: The session ID, if any.
-            chat_id: The chat ID, if any.
-            user_id: The user ID, if any.
-            
-        Returns:
-            A tuple containing the created AgentInteraction record, session_id, and chat_id.
+        - Uses LangChain's SQLAlchemyChatMessageHistory to manage history.
+        - Formats the last 10 messages.
+        - Constructs and executes a LangChain LCEL chain to determine tasks.
+        - Appends both user message and assistant reply using LangChain's message history.
+        - Logs the interaction in the AgentInteraction table and returns it.
         """
         # 1. Retrieve or create the session and chat history
-        session_record, chat_history = cls.get_or_create_session(db, session_id, chat_id, user_id)
+        session_record, chat_history_rec = cls.get_or_create_session(db, session_id, chat_id, user_id)
         current_session_id = session_record.session_id
-        current_chat_id = chat_history.chat_id
+        current_chat_id = chat_history_rec.chat_id
         
-        # 2. Parse the existing message history
-        try:
-            messages = json.loads(chat_history.chat_messages)
-        except Exception:
-            messages = []
-
+        # 2. Instantiate our SQLAlchemyChatMessageHistory adapter
+        history = SQLAlchemyChatMessageHistory(
+            session_id=current_session_id,
+            chat_id=current_chat_id,
+            db=db
+        )
         
-        # Extract and format the last 10 messages of conversation history (before current user_input is added)
-        formatted_history = cls.format_last_10_messages(messages)
+        # 3. Format the last 10 messages of conversation history (before current user_input is added)
+        formatted_history = cls.format_last_10_messages(history.messages)
         
-        # 3. Append the new user message to the local list (to update chat log in database)
-        messages.append({"role": "user", "content": user_input})
-        
-        # Construct prompt differentiating the history and the current user input
-        planner_prompt = f"""
+        # 4. Construct prompt and LCEL chain
+        prompt = ChatPromptTemplate.from_template("""
             You are an autonomous planning agent.
 
             Your responsibilities:
@@ -166,7 +225,7 @@ class ChatService:
             7. Return only valid JSON.
 
             Conversation History:
-            {formatted_history or "No previous history."}
+            {history}
 
             Current User Request:
             {user_input}
@@ -185,25 +244,29 @@ class ChatService:
                     }}
                 ]
             }}
-        """
-
-        # 4. Invoke the LLM using the structured prompt
+        """)
+        
+        llm = LLMService.get_llm()
+        chain = (
+            RunnablePassthrough.assign(
+                history=lambda x: formatted_history or "No previous history."
+            )
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+        
+        # 5. Invoke the LLM using the LCEL chain
         try:
-            llm_response = await LLMService.complete_prompt(prompt=planner_prompt)
-            choices = llm_response.get("choices", [])
-            if choices:
-                assistant_response = choices[0].get("message", {}).get("content", "").strip()
-            else:
-                assistant_response = "Error: No response generated from the LLM."
+            assistant_response = await chain.ainvoke({
+                "user_input": user_input
+            })
+            assistant_response = assistant_response.strip()
         except Exception as e:
             assistant_response = f"Error communicating with LLM: {str(e)}"
-
-                # ... (After getting the assistant_response from the LLM) ...
-        
-        # 1. Parse the LLM's Planner JSON and write it to the DOCX file
         
         # Clean up any markdown code blocks (e.g. ```json ... ```) if the LLM wrapped it
-        clean_json = assistant_response.strip()
+        clean_json = assistant_response
         if "```" in clean_json:
             lines = [line for line in clean_json.split("\n") if not line.strip().startswith("```")]
             clean_json = "\n".join(lines).strip()
@@ -226,13 +289,12 @@ class ChatService:
             # Fallback if the LLM output is not valid JSON
             print(f"Failed to parse LLM planner JSON: {e}. Output was: {assistant_response}")
             add_todo_to_docx(f"Unstructured Task: {assistant_response}", current_session_id)
-
             
-        # 5. Append assistant response to history
-        messages.append({"role": "assistant", "content": assistant_response})
-        
-        # 6. Save updated history back to database
-        chat_history.chat_messages = json.dumps(messages)
+        # 6. Save the new interaction to LangChain's history adapter
+        history.add_messages([
+            HumanMessage(content=user_input),
+            AIMessage(content=assistant_response)
+        ])
         
         # 7. Record the interaction
         interaction = AgentInteraction(
