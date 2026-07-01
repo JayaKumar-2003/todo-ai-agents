@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import database
 import models
 import schemas
+from fastapi.responses import FileResponse
 
 # Load environment variables from .env
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +25,21 @@ app = FastAPI(
 
 from services.chat import ChatService
 
+
+from services.todo_docx import get_docx_path
+
+@app.get("/todos/download")
+def download_todo_document(session_id: str):
+    file_path = get_docx_path(session_id)
+    if not os.path.exists(file_path):
+        return {"error": f"No TODO list document exists yet for Session ID {session_id}."}
+    
+    return FileResponse(
+        path=file_path, 
+        filename=f"todos_{session_id}.docx", 
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+
 # To run the application:
 # uvicorn main:app --reload
 #
@@ -31,7 +47,7 @@ from services.chat import ChatService
 # curl -X POST "http://127.0.0.1:8000/agent" \
 #      -H "Content-Type: application/json" \
 #      -d '{"user_input": "Hello Agent!", "session_id": "optional-session-id", "chat_id": "optional-chat-id", "user_id": 1}'
-@app.post("/agent", response_model=schemas.InteractionResponse)
+@app.post("/agent")
 async def process_agent_task(
     payload: schemas.InteractionCreate, 
     db: Session = Depends(database.get_db)
@@ -43,7 +59,16 @@ async def process_agent_task(
         chat_id=payload.chat_id,
         user_id=payload.user_id
     )
-    return db_interaction
+    
+    # Get path to the session-specific Word Document
+    file_path = get_docx_path(session_id)
+    
+    # Return the file directly as the response
+    return FileResponse(
+        path=file_path, 
+        filename=f"todos_{session_id}.docx", 
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
 
 
 # To generate/create a new session ID (optionally for a user):

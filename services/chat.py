@@ -6,6 +6,7 @@ from models.chat_history import ChatHistory
 from models.agent_interaction import AgentInteraction
 from services.llm import LLMService
 from typing import Tuple
+from services.todo_docx import add_todo_to_docx, read_todos_from_docx
 
 class ChatService:
     """
@@ -151,18 +152,44 @@ class ChatService:
         messages.append({"role": "user", "content": user_input})
         
         # Construct prompt differentiating the history and the current user input
-        llm_prompt = (
-            "You are a conversation agent. Below is the recent conversation history followed by the current user message.\n\n"
-            "--- Conversation History ---\n"
-            f"{formatted_history or 'No previous history.'}\n"
-            "--- Current Message ---\n"
-            f"User: {user_input}\n\n"
-            "Assistant:"
-        )
-        
+        planner_prompt = f"""
+            You are an autonomous planning agent.
+
+            Your responsibilities:
+
+            1. Understand the user's request.
+            2. Analyze previous conversation history if available.
+            3. Determine the user's final goal.
+            4. Create a detailed TODO/task list required to complete the goal.
+            5. Decide if any external information, web search, or tools are required.
+            6. Make reasonable assumptions when information is missing.
+            7. Return only valid JSON.
+
+            Conversation History:
+            {formatted_history or "No previous history."}
+
+            Current User Request:
+            {user_input}
+
+            Return JSON in the following format:
+
+            {{
+                "goal": "",
+                "requires_external_data": true,
+                "assumptions": [],
+                "tasks": [
+                    {{
+                        "task_id": 1,
+                        "task_name": "",
+                        "reason": ""
+                    }}
+                ]
+            }}
+        """
+
         # 4. Invoke the LLM using the structured prompt
         try:
-            llm_response = await LLMService.complete_prompt(prompt=llm_prompt)
+            llm_response = await LLMService.complete_prompt(prompt=planner_prompt)
             choices = llm_response.get("choices", [])
             if choices:
                 assistant_response = choices[0].get("message", {}).get("content", "").strip()
@@ -170,6 +197,36 @@ class ChatService:
                 assistant_response = "Error: No response generated from the LLM."
         except Exception as e:
             assistant_response = f"Error communicating with LLM: {str(e)}"
+
+                # ... (After getting the assistant_response from the LLM) ...
+        
+        # 1. Parse the LLM's Planner JSON and write it to the DOCX file
+        
+        # Clean up any markdown code blocks (e.g. ```json ... ```) if the LLM wrapped it
+        clean_json = assistant_response.strip()
+        if "```" in clean_json:
+            lines = [line for line in clean_json.split("\n") if not line.strip().startswith("```")]
+            clean_json = "\n".join(lines).strip()
+            
+        try:
+            planner_data = json.loads(clean_json)
+            tasks = planner_data.get("tasks", [])
+            
+            for task in tasks:
+                task_name = task.get("task_name")
+                reason = task.get("reason", "")
+                
+                if task_name:
+                    # Construct a descriptive task line to write to Word
+                    task_description = f"{task_name} (Reason: {reason})" if reason else task_name
+                    # Write it to todos_{session_id}.docx
+                    add_todo_to_docx(task_description, current_session_id)
+                    
+        except json.JSONDecodeError as e:
+            # Fallback if the LLM output is not valid JSON
+            print(f"Failed to parse LLM planner JSON: {e}. Output was: {assistant_response}")
+            add_todo_to_docx(f"Unstructured Task: {assistant_response}", current_session_id)
+
             
         # 5. Append assistant response to history
         messages.append({"role": "assistant", "content": assistant_response})
