@@ -1,6 +1,8 @@
 import uuid
 import json
-from typing import Tuple
+from typing import Tuple, TypedDict, Optional, List
+# pyrefly: ignore [missing-import]
+from langgraph.graph import StateGraph, START, END
 from sqlalchemy.orm import Session
 from models.session import SessionTable
 from models.chat_history import ChatHistory
@@ -79,6 +81,15 @@ class SQLAlchemyChatMessageHistory(BaseChatMessageHistory):
     def clear(self) -> None:
         self.chat_history_record.chat_messages = json.dumps([])
         self.db.commit()
+
+class AgentState(TypedDict):
+    history: str
+    user_input: str
+    proposed_plan: str
+    feedback: str
+    is_correct: bool
+    iteration: int
+    max_iterations: int
 
 class ChatService:
     """
@@ -256,17 +267,177 @@ class ChatService:
             | StrOutputParser()
         )
         
-        # 5. Invoke the LLM using the LCEL chain
-        try:
-            assistant_response = await chain.ainvoke({
-                "user_input": user_input
-            })
-            assistant_response = assistant_response.strip()
-        except Exception as e:
-            assistant_response = f"Error communicating with LLM: {str(e)}"
+        # Critic/Verifier Prompt and Chain
+        critic_prompt = ChatPromptTemplate.from_template("""
+            You are an autonomous plan verifier/critic.
+            Your task is to evaluate the proposed plan against the user's request and conversation history.
+
+            Conversation History:
+            {history}
+
+            User Request:
+            {user_input}
+
+            Proposed Plan (JSON):
+            {proposed_plan}
+
+            Evaluate the proposed plan based on the following criteria:
+            1. Does it completely solve the user's request?
+            2. Are all tasks necessary and sequence-logical?
+            3. Are the assumptions reasonable?
+            4. Are there any missing tasks?
+
+            Provide your evaluation in the following JSON format:
+            {{
+                "is_correct": true/false,
+                "feedback": "Detailed feedback describing what is wrong, missing, or needs improvement in the plan. Leave empty if is_correct is true."
+            }}
+        """)
         
-        # Clean up any markdown code blocks (e.g. ```json ... ```) if the LLM wrapped it
-        clean_json = assistant_response
+        critic_chain = critic_prompt | llm | StrOutputParser()
+
+        # Refiner Prompt and Chain
+        refiner_prompt = ChatPromptTemplate.from_template("""
+            You are an autonomous planning refiner.
+            Your task is to correct and refine the proposed plan based on feedback from the plan verifier.
+
+            Conversation History:
+            {history}
+
+            User Request:
+            {user_input}
+
+            Previously Proposed Plan:
+            {proposed_plan}
+
+            Verifier Feedback:
+            {feedback}
+
+            Refine the plan to address the feedback. Keep the format exactly the same as the proposed plan.
+
+            Return JSON in the following format:
+            {{
+                "goal": "",
+                "requires_external_data": true,
+                "assumptions": [],
+                "tasks": [
+                    {{
+                        "task_id": 1,
+                        "task_name": "",
+                        "reason": ""
+                    }}
+                ]
+            }}
+        """)
+        
+        refiner_chain = refiner_prompt | llm | StrOutputParser()
+
+        # Define node functions (using closures for chains)
+        async def planner_node(state: AgentState) -> dict:
+            try:
+                response = await chain.ainvoke({"user_input": state["user_input"]})
+                plan = response.strip()
+            except Exception as e:
+                plan = f"Error: {e}"
+            return {"proposed_plan": plan}
+
+        async def critic_node(state: AgentState) -> dict:
+            clean_plan = state["proposed_plan"]
+            if "```" in clean_plan:
+                lines = [line for line in clean_plan.split("\n") if not line.strip().startswith("```")]
+                clean_plan = "\n".join(lines).strip()
+            
+            try:
+                response = await critic_chain.ainvoke({
+                    "history": state["history"],
+                    "user_input": state["user_input"],
+                    "proposed_plan": clean_plan
+                })
+                response = response.strip()
+                
+                clean_critic = response
+                if "```" in clean_critic:
+                    lines = [line for line in clean_critic.split("\n") if not line.strip().startswith("```")]
+                    clean_critic = "\n".join(lines).strip()
+                
+                critic_data = json.loads(clean_critic)
+                is_correct = critic_data.get("is_correct", False)
+                feedback = critic_data.get("feedback", "")
+            except Exception as e:
+                print(f"Error in critic node: {e}")
+                is_correct = True # Bypass loop on errors to avoid infinite loops
+                feedback = str(e)
+                
+            return {"is_correct": is_correct, "feedback": feedback}
+
+        async def refiner_node(state: AgentState) -> dict:
+            clean_plan = state["proposed_plan"]
+            if "```" in clean_plan:
+                lines = [line for line in clean_plan.split("\n") if not line.strip().startswith("```")]
+                clean_plan = "\n".join(lines).strip()
+                
+            next_iteration = state["iteration"] + 1
+            print(f"--- Agent Loop (LangGraph): Iteration {next_iteration} ---")
+            print(f"Plan rejected. Feedback: {state['feedback']}")
+            
+            try:
+                response = await refiner_chain.ainvoke({
+                    "history": state["history"],
+                    "user_input": state["user_input"],
+                    "proposed_plan": clean_plan,
+                    "feedback": state["feedback"]
+                })
+                plan = response.strip()
+            except Exception as e:
+                plan = clean_plan # Keep current plan on error
+                print(f"Error in refiner node: {e}")
+                
+            return {"proposed_plan": plan, "iteration": next_iteration}
+
+        def should_continue(state: AgentState):
+            if state["is_correct"] or state["iteration"] >= state["max_iterations"]:
+                return "end"
+            return "refiner"
+
+        # Build LangGraph workflow
+        workflow = StateGraph(AgentState)
+        
+        workflow.add_node("planner", planner_node)
+        workflow.add_node("critic", critic_node)
+        workflow.add_node("refiner", refiner_node)
+        
+        workflow.set_entry_point("planner")
+        workflow.add_edge("planner", "critic")
+        
+        workflow.add_conditional_edges(
+            "critic",
+            should_continue,
+            {
+                "end": END,
+                "refiner": "refiner"
+            }
+        )
+        
+        workflow.add_edge("refiner", "critic")
+        
+        graph = workflow.compile()
+
+        # Run graph
+        initial_state = {
+            "history": formatted_history or "No previous history.",
+            "user_input": user_input,
+            "proposed_plan": "",
+            "feedback": "",
+            "is_correct": False,
+            "iteration": 0,
+            "max_iterations": 3
+        }
+        
+        final_state = await graph.ainvoke(initial_state)
+        current_plan_str = final_state["proposed_plan"]
+
+        # Clean final plan
+        clean_json = current_plan_str
         if "```" in clean_json:
             lines = [line for line in clean_json.split("\n") if not line.strip().startswith("```")]
             clean_json = "\n".join(lines).strip()
@@ -287,19 +458,19 @@ class ChatService:
                     
         except json.JSONDecodeError as e:
             # Fallback if the LLM output is not valid JSON
-            print(f"Failed to parse LLM planner JSON: {e}. Output was: {assistant_response}")
-            add_todo_to_docx(f"Unstructured Task: {assistant_response}", current_session_id)
+            print(f"Failed to parse LLM planner JSON: {e}. Output was: {current_plan_str}")
+            add_todo_to_docx(f"Unstructured Task: {current_plan_str}", current_session_id)
             
         # 6. Save the new interaction to LangChain's history adapter
         history.add_messages([
             HumanMessage(content=user_input),
-            AIMessage(content=assistant_response)
+            AIMessage(content=current_plan_str)
         ])
         
         # 7. Record the interaction
         interaction = AgentInteraction(
             user_input=user_input,
-            response=assistant_response,
+            response=current_plan_str,
             session_id=current_session_id,
             chat_id=current_chat_id,
             user_id=session_record.user_id
